@@ -31,23 +31,28 @@
     groups share the name the script aborts and lists the matches.
 
 .PARAMETER OutputPath
-    Path to the CSV file to create. Default: .\entra-group-export.csv.
+    Path to the CSV file to create. Default: .\outputs\entra-group-export.csv.
 
 .PARAMETER TenantId
-    Entra tenant id (GUID or domain). Defaults to the AZURE_TENANT_ID env var.
+    Entra tenant id (GUID or domain). Resolved in order: parameter > AZURE_TENANT_ID
+    environment variable > AZURE_TENANT_ID in $PSScriptRoot/.env.
 
 .PARAMETER ClientId
-    App registration (client) id. Defaults to the AZURE_CLIENT_ID env var.
+    App registration (client) id. Resolved in order: parameter > AZURE_CLIENT_ID env
+    var > AZURE_CLIENT_ID in $PSScriptRoot/.env.
 
 .PARAMETER ClientSecret
-    App registration client secret. Defaults to the AZURE_CLIENT_SECRET env var.
+    App registration client secret. Resolved in order: parameter > AZURE_CLIENT_SECRET
+    env var > AZURE_CLIENT_SECRET in $PSScriptRoot/.env.
 
 .PARAMETER AccessToken
     A pre-acquired Microsoft Graph access token. If supplied, the client-credential
-    parameters are ignored.
+    parameters are ignored. Resolved in order: parameter > AZURE_ACCESS_TOKEN env var
+    > AZURE_ACCESS_TOKEN in $PSScriptRoot/.env.
 
 .PARAMETER GraphBaseUrl
-    Microsoft Graph base URL. Default: https://graph.microsoft.com/v1.0.
+    Microsoft Graph base URL. Resolved in order: parameter > GRAPH_BASE_URL env var >
+    GRAPH_BASE_URL in $PSScriptRoot/.env > https://graph.microsoft.com/v1.0.
     Use https://graph.microsoft.us/v1.0 for US Government, etc.
 
 .PARAMETER Transitive
@@ -58,8 +63,8 @@
     Name of the Entra/Graph user property that holds the user's GitHub username.
     When supplied, this property's value is written to the email column instead of
     the user's email/UPN, so the resulting CSV can be fed to
-    Set-CostCentreMembership.ps1 with -SkipScimLookup to look up users directly by
-    their GitHub handle (no SCIM email->username resolution required).
+    Set-CostCentreMembership.ps1 with -SkipUserLookup to look up users directly by
+    their GitHub handle (no Copilot seats / /users lookup required).
 
     Supports:
       * Top-level user properties (e.g. 'userPrincipalName').
@@ -75,11 +80,24 @@
 
 .PARAMETER CostCentreColumn
     Header name for the cost-centre column. Default: 'cost_centre' (matches the
-    cost-centre script). The department value is written here.
+    cost-centre script). The cost-centre value is written here.
+
+.PARAMETER CostCentreProperty
+    Name of the Entra/Graph user property whose value is written to the cost-centre
+    column. Default: 'department'.
+
+    Supports the same forms as -GitHubUsernameProperty:
+      * Top-level user properties (e.g. 'jobTitle', 'companyName').
+      * Schema/on-premises extension attributes by short name, e.g.
+        'extensionAttribute2' (resolved under onPremisesExtensionAttributes).
+      * Dot-notation paths for nested or directory-extension properties, e.g.
+        'onPremisesExtensionAttributes.extensionAttribute2' or
+        'extension_<appId>_costCentre'.
 
 .PARAMETER DefaultCostCentre
-    Value to use when a member has no department. Without this, members lacking a
-    department are written with a blank cost-centre and a warning is logged.
+    Value to use when a member has no value for the cost-centre source property.
+    Without this, members lacking a value are written with a blank cost-centre and
+    a warning is logged.
 
 .PARAMETER LogPath
     Optional path to a log file. Console output is also written there.
@@ -98,7 +116,7 @@
     # then assign cost centres by looking users up directly by their GitHub handle.
     .\Export-EntraGroupToCsv.ps1 -GroupName "Engineering" -GitHubUsernameProperty extensionAttribute1 `
         -OutputPath .\handles.csv
-    .\Set-CostCentreMembership.ps1 -CsvPath .\handles.csv -Enterprise contoso -SkipScimLookup -WhatIf
+    .\Set-CostCentreMembership.ps1 -CsvPath .\handles.csv -Enterprise contoso -SkipUserLookup -WhatIf
 
 .NOTES
     Output CSV columns: name,email,cost_centre
@@ -113,22 +131,22 @@ param(
     [string]$GroupName,
 
     [Parameter()]
-    [string]$OutputPath = '.\entra-group-export.csv',
+    [string]$OutputPath = '.\outputs\entra-group-export.csv',
 
     [Parameter()]
-    [string]$TenantId = $env:AZURE_TENANT_ID,
+    [string]$TenantId,
 
     [Parameter()]
-    [string]$ClientId = $env:AZURE_CLIENT_ID,
+    [string]$ClientId,
 
     [Parameter()]
-    [string]$ClientSecret = $env:AZURE_CLIENT_SECRET,
+    [string]$ClientSecret,
 
     [Parameter()]
     [string]$AccessToken,
 
     [Parameter()]
-    [string]$GraphBaseUrl = 'https://graph.microsoft.com/v1.0',
+    [string]$GraphBaseUrl,
 
     [Parameter()]
     [switch]$Transitive,
@@ -143,6 +161,9 @@ param(
     [string]$CostCentreColumn = 'cost_centre',
 
     [Parameter()]
+    [string]$CostCentreProperty = 'department',
+
+    [Parameter()]
     [string]$DefaultCostCentre,
 
     [Parameter()]
@@ -153,6 +174,62 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 #region Helpers ----------------------------------------------------------------
+
+function Get-DotEnvValues {
+    <#
+        Reads KEY=VALUE pairs from a .env file and returns a hashtable.
+        Supports quoted values, ignores blank lines and full-line comments.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $values = @{}
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $values
+    }
+
+    $lineNumber = 0
+    foreach ($rawLine in (Get-Content -LiteralPath $Path)) {
+        $lineNumber++
+        $line = "$rawLine".Trim()
+
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#')) {
+            continue
+        }
+
+        $eqIndex = $line.IndexOf('=')
+        if ($eqIndex -lt 1) {
+            Write-Warning ".env line $lineNumber in '$Path' is invalid and will be ignored."
+            continue
+        }
+
+        $name = $line.Substring(0, $eqIndex).Trim()
+        $value = $line.Substring($eqIndex + 1).Trim()
+
+        if ($name.StartsWith('export ')) {
+            $name = $name.Substring(7).Trim()
+        }
+
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            Write-Warning ".env line $lineNumber in '$Path' has an empty key and will be ignored."
+            continue
+        }
+
+        if (
+            ($value.StartsWith('"') -and $value.EndsWith('"') -and $value.Length -ge 2) -or
+            ($value.StartsWith("'") -and $value.EndsWith("'") -and $value.Length -ge 2)
+        ) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        elseif ($value -match '^([^#]*?)\s+#') {
+            # Support inline comments for unquoted values: KEY=value # comment
+            $value = $Matches[1].TrimEnd()
+        }
+
+        $values[$name] = $value
+    }
+
+    return $values
+}
 
 function Write-Log {
     param(
@@ -324,12 +401,11 @@ function Get-GroupMemberIds {
     return $ids
 }
 
-function Get-GitHubUsernameSelect {
+function Get-UserPropertySelect {
     <#
         Returns the top-level Graph $select segment required to retrieve the
-        configured GitHub-username property. Short extensionAttributeN names are
-        resolved under onPremisesExtensionAttributes; dot-paths use their first
-        segment.
+        given user property. Short extensionAttributeN names are resolved under
+        onPremisesExtensionAttributes; dot-paths use their first segment.
     #>
     param([Parameter(Mandatory = $true)][string]$Property)
 
@@ -339,11 +415,11 @@ function Get-GitHubUsernameSelect {
     return ($Property -split '\.')[0]
 }
 
-function Get-GitHubUsernameValue {
+function Get-UserPropertyValue {
     <#
-        Resolves the GitHub-username value from a user object for the configured
-        property. Supports top-level properties, extensionAttributeN short names
-        (resolved under onPremisesExtensionAttributes) and dot-notation paths.
+        Resolves a value from a user object for the given property name. Supports
+        top-level properties, extensionAttributeN short names (resolved under
+        onPremisesExtensionAttributes) and dot-notation paths.
     #>
     param(
         [Parameter(Mandatory = $true)]$User,
@@ -375,13 +451,15 @@ function Get-UsersByIds {
     #>
     param([Parameter(Mandatory = $true)][string[]]$Ids)
 
-    $select = 'id,displayName,mail,userPrincipalName,department'
-    if (-not [string]::IsNullOrWhiteSpace($GitHubUsernameProperty)) {
-        $extraSelect = Get-GitHubUsernameSelect -Property $GitHubUsernameProperty
-        if (($select -split ',') -notcontains $extraSelect) {
-            $select += ",$extraSelect"
-        }
+    $selectParts = [System.Collections.Generic.List[string]]::new()
+    foreach ($p in @('id', 'displayName', 'mail', 'userPrincipalName')) { $selectParts.Add($p) }
+
+    foreach ($prop in @($CostCentreProperty, $GitHubUsernameProperty)) {
+        if ([string]::IsNullOrWhiteSpace($prop)) { continue }
+        $segment = Get-UserPropertySelect -Property $prop
+        if (-not $selectParts.Contains($segment)) { $selectParts.Add($segment) }
     }
+    $select = $selectParts -join ','
     $batchSize = 15
     $users = [System.Collections.Generic.List[object]]::new()
 
@@ -404,13 +482,13 @@ function Get-UsersByIds {
 function Get-GroupMembers {
     <#
         Returns the user members of a group, each with displayName, mail,
-        userPrincipalName and department.
+        userPrincipalName and the configured cost-centre source property.
 
         Strategy:
           Step 1 - get member ids from the group members endpoint (reliably returns
                    ids but not always extended properties like 'department').
           Step 2 - fetch full user objects in batches from /users?$filter=id in (...)
-                   which reliably returns all selected properties including 'department'.
+                   which reliably returns all selected properties.
     #>
     param([Parameter(Mandatory = $true)][string]$Id)
 
@@ -439,11 +517,46 @@ if ($LogPath) {
     }
 }
 
+# Resolve configuration from parameters, environment variables, then .env.
+$dotEnvPath = Join-Path -Path $PSScriptRoot -ChildPath '.env'
+$dotEnvValues = Get-DotEnvValues -Path $dotEnvPath
+
+function Resolve-ConfigValue {
+    param(
+        [Parameter(Mandatory)][string]$ParamName,
+        [string]$Current,
+        [Parameter(Mandatory)][string]$EnvName,
+        [hashtable]$DotEnv,
+        [string]$Default = ''
+    )
+    if ($script:CallerBoundParameters.ContainsKey($ParamName) -and -not [string]::IsNullOrWhiteSpace($Current)) {
+        return $Current
+    }
+    $envValue = [Environment]::GetEnvironmentVariable($EnvName)
+    if (-not [string]::IsNullOrWhiteSpace($envValue)) { return $envValue }
+    if ($DotEnv -and $DotEnv.ContainsKey($EnvName) -and -not [string]::IsNullOrWhiteSpace($DotEnv[$EnvName])) {
+        return $DotEnv[$EnvName]
+    }
+    return $Default
+}
+
+$script:CallerBoundParameters = $PSBoundParameters
+$TenantId     = Resolve-ConfigValue -ParamName 'TenantId'     -Current $TenantId     -EnvName 'AZURE_TENANT_ID'     -DotEnv $dotEnvValues
+$ClientId     = Resolve-ConfigValue -ParamName 'ClientId'     -Current $ClientId     -EnvName 'AZURE_CLIENT_ID'     -DotEnv $dotEnvValues
+$ClientSecret = Resolve-ConfigValue -ParamName 'ClientSecret' -Current $ClientSecret -EnvName 'AZURE_CLIENT_SECRET' -DotEnv $dotEnvValues
+$AccessToken  = Resolve-ConfigValue -ParamName 'AccessToken'  -Current $AccessToken  -EnvName 'AZURE_ACCESS_TOKEN'  -DotEnv $dotEnvValues
+$GraphBaseUrl = Resolve-ConfigValue -ParamName 'GraphBaseUrl' -Current $GraphBaseUrl -EnvName 'GRAPH_BASE_URL'      -DotEnv $dotEnvValues -Default 'https://graph.microsoft.com/v1.0'
+
+if ($dotEnvValues.Count -gt 0) {
+    Write-Log "Loaded $($dotEnvValues.Count) value(s) from .env at '$dotEnvPath'." 'DEBUG'
+}
+
 $script:GraphBaseUrl = $GraphBaseUrl.TrimEnd('/')
 
 Write-Log "===== Entra group -> CSV export ====="
 Write-Log "Graph base : $script:GraphBaseUrl"
 Write-Log "Output     : $OutputPath"
+Write-Log "Cost centre: property '$CostCentreProperty' (written to '$CostCentreColumn' column)."
 if (-not [string]::IsNullOrWhiteSpace($GitHubUsernameProperty)) {
     Write-Log "Identifier : GitHub username from property '$GitHubUsernameProperty' (written to '$EmailColumn' column)."
 }
@@ -455,7 +568,7 @@ if ($AccessToken) {
 }
 else {
     if ([string]::IsNullOrWhiteSpace($TenantId) -or [string]::IsNullOrWhiteSpace($ClientId) -or [string]::IsNullOrWhiteSpace($ClientSecret)) {
-        throw "Provide either -AccessToken, or -TenantId/-ClientId/-ClientSecret (or the AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET environment variables)."
+        throw "Provide either -AccessToken, or -TenantId/-ClientId/-ClientSecret (or set AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET via environment variables or .env)."
     }
     $script:Token = Get-GraphToken -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -GraphBaseUrl $script:GraphBaseUrl
 }
@@ -478,8 +591,8 @@ foreach ($m in $members) {
 
     if ($usingGitHubUsername) {
         # Write the GitHub username (from the configured Entra property) to the
-        # email column so the CSV can be used with -SkipScimLookup downstream.
-        $email = "$(Get-GitHubUsernameValue -User $m -Property $GitHubUsernameProperty)".Trim()
+        # email column so the CSV can be used with -SkipUserLookup downstream.
+        $email = "$(Get-UserPropertyValue -User $m -Property $GitHubUsernameProperty)".Trim()
     }
     else {
         # Prefer mail, fall back to userPrincipalName.
@@ -487,7 +600,7 @@ foreach ($m in $members) {
         if ([string]::IsNullOrWhiteSpace($email)) { $email = "$($m.userPrincipalName)".Trim() }
     }
 
-    $dept = "$($m.department)".Trim()
+    $dept = "$(Get-UserPropertyValue -User $m -Property $CostCentreProperty)".Trim()
     if ([string]::IsNullOrWhiteSpace($dept) -and $DefaultCostCentre) { $dept = $DefaultCostCentre }
 
     if ([string]::IsNullOrWhiteSpace($email)) {
@@ -497,7 +610,7 @@ foreach ($m in $members) {
         continue
     }
     if ([string]::IsNullOrWhiteSpace($dept)) {
-        Write-Log "Member '$name' <$email> has no department - cost centre will be blank." 'WARN'
+        Write-Log "Member '$name' <$email> has no value for '$CostCentreProperty' - cost centre will be blank." 'WARN'
         $missingDept.Add($email)
     }
 
@@ -529,7 +642,7 @@ if ($missingDept.Count -gt 0) {
 }
 Write-Log "CSV written to: $OutputPath" 'SUCCESS'
 $nextCmd = $usingGitHubUsername `
-    ? ".\Set-CostCentreMembership.ps1 -CsvPath '$OutputPath' -Enterprise <slug> -SkipScimLookup -WhatIf" `
+    ? ".\Set-CostCentreMembership.ps1 -CsvPath '$OutputPath' -Enterprise <slug> -SkipUserLookup -WhatIf" `
     : ".\Set-CostCentreMembership.ps1 -CsvPath '$OutputPath' -Enterprise <slug> -WhatIf"
 Write-Log "Next: $nextCmd" 'INFO'
 
