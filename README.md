@@ -1,6 +1,6 @@
 # GitHub Enterprise Cost Centre Membership
 
-PowerShell 7 tooling that assigns GitHub Enterprise Copilot users to cost centres
+PowerShell scripts that assigns GitHub Enterprise Copilot users to cost centres
 from a CSV, plus a companion script that generates that CSV from an Entra ID group.
 
 The cost‑centre API logic mirrors the [`github/cost-center-automation`](https://github.com/github/cost-center-automation)
