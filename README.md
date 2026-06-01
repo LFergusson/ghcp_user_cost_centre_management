@@ -5,7 +5,7 @@ from a CSV, plus a companion script that generates that CSV from an Entra ID
 (Azure AD) group.
 
 The cost‑centre API logic mirrors the [`github/cost-center-automation`](https://github.com/github/cost-center-automation)
-project, reimplemented in PowerShell for CSV‑driven assignment.
+project, reimplemented in PowerShell for CSV‑driven assignment in environments with a preference for PowerShell.
 
 ## Contents
 
